@@ -1,6 +1,6 @@
-# Gamma Risk Allocator — Upload by Strategy
+# Gamma Risk Allocator — Upload by Strategy + Data Management
 
-A Streamlit app for TradeSteward group uploads with strategy-specific analysis.
+A Streamlit app for TradeSteward group uploads with strategy-specific analysis and upload deletion controls.
 
 ## Upload workflow
 
@@ -12,18 +12,21 @@ A Streamlit app for TradeSteward group uploads with strategy-specific analysis.
    - Range
    - Greenday
    - Power Hour
-3. Upload one or more TradeSteward CSV files for that selected strategy.
+3. Upload TradeSteward CSV files for that selected strategy.
 
-The app stores the strategy with every trade, so allocation and gamma-risk diagnostics remain strategy-specific.
+## Data management
+
+The app includes controls to:
+
+- Delete one specific upload
+- Bulk delete by strategy and/or upload type
+- Reset all uploaded data
+
+Deleting an upload removes both the upload record and the associated trades.
 
 ## No manual regime selection
 
-The app auto-detects the current regime from uploaded history and current data.
-
-## Strategy framework
-
-- Weak and Range = core lower-gamma-risk sleeves.
-- Greenday and Power Hour = tactical sleeves for calm/compressing markets.
+The app auto-detects the current gamma-risk regime from uploaded history and current data.
 
 ## Run locally
 
@@ -46,7 +49,3 @@ Main file path:
 ```text
 app.py
 ```
-
-## Storage note
-
-On Streamlit Cloud's free tier, local SQLite data may reset when the app restarts. For durable group storage, connect a persistent database later.

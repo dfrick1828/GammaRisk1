@@ -247,6 +247,55 @@ def load_uploads() -> pd.DataFrame:
     return df
 
 
+def delete_upload(upload_id: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT stored_filename FROM uploads WHERE upload_id = ?",
+            (upload_id,),
+        ).fetchone()
+
+        conn.execute("DELETE FROM trades WHERE upload_id = ?", (upload_id,))
+        conn.execute("DELETE FROM uploads WHERE upload_id = ?", (upload_id,))
+        conn.commit()
+
+    if row:
+        stored_path = UPLOAD_DIR / row[0]
+        if stored_path.exists():
+            stored_path.unlink()
+
+
+def delete_by_filter(strategy: Optional[str] = None, upload_type: Optional[str] = None) -> int:
+    query = "SELECT upload_id, stored_filename FROM uploads WHERE 1=1"
+    params = []
+
+    if strategy:
+        query += " AND strategy_name = ?"
+        params.append(strategy)
+
+    if upload_type:
+        query += " AND upload_type = ?"
+        params.append(upload_type)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    for upload_id, _stored_filename in rows:
+        delete_upload(upload_id)
+
+    return len(rows)
+
+
+def reset_database() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM uploads")
+        conn.commit()
+
+    for p in UPLOAD_DIR.glob("*"):
+        if p.is_file():
+            p.unlink()
+
+
 # ------------------------------------------------------------
 # Analytics
 # ------------------------------------------------------------
@@ -562,14 +611,64 @@ m1.metric("Total slippage", f"${total_slip:,.0f}")
 m2.metric("Top 3 days share", f"{top3_share:.1%}")
 m3.metric("Top 10 days share", f"{top10_share:.1%}")
 
-with st.expander("Recent uploads"):
+st.divider()
+st.subheader("Data Management")
+
+with st.expander("Upload history and delete controls", expanded=False):
     if uploads.empty:
         st.write("No uploads yet.")
     else:
+        st.caption("Delete individual uploads if someone uploads the wrong strategy, wrong upload type, duplicate file, or corrupted export.")
+
+        uploads_display = uploads.copy()
+        uploads_display["uploaded_at"] = pd.to_datetime(uploads_display["uploaded_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+
         st.dataframe(
-            uploads[["uploaded_at", "upload_type", "trader_alias", "strategy_name", "original_filename", "row_count"]],
+            uploads_display[["uploaded_at", "upload_type", "trader_alias", "strategy_name", "original_filename", "row_count", "upload_id"]],
             use_container_width=True,
         )
+
+        st.markdown("### Delete one upload")
+        upload_options = [
+            f"{r.uploaded_at} | {r.strategy_name} | {r.upload_type} | {r.trader_alias} | {r.original_filename} | {r.upload_id}"
+            for _, r in uploads_display.iterrows()
+        ]
+
+        selected_upload_label = st.selectbox("Select upload to delete", upload_options)
+        selected_upload_id = selected_upload_label.split("|")[-1].strip()
+
+        confirm_single = st.checkbox("Confirm delete selected upload")
+        if st.button("Delete selected upload", type="secondary", disabled=not confirm_single):
+            delete_upload(selected_upload_id)
+            st.success("Selected upload deleted.")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Bulk delete")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            bulk_strategy = st.selectbox("Strategy filter", ["All strategies"] + STRATEGIES)
+        with c2:
+            bulk_type = st.selectbox("Upload type filter", ["All upload types", "Historical backfill", "Daily update"])
+
+        strategy_filter = None if bulk_strategy == "All strategies" else bulk_strategy
+        type_filter = None if bulk_type == "All upload types" else bulk_type
+
+        confirm_bulk_text = st.text_input("Type DELETE to confirm bulk delete")
+        if st.button("Bulk delete matching uploads", type="secondary", disabled=confirm_bulk_text != "DELETE"):
+            deleted = delete_by_filter(strategy_filter, type_filter)
+            st.success(f"Deleted {deleted} matching upload(s).")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Reset all data")
+        st.warning("This removes every upload, every trade, and every stored CSV.")
+        confirm_reset_text = st.text_input("Type RESET ALL to confirm full reset")
+        if st.button("Reset database", type="secondary", disabled=confirm_reset_text != "RESET ALL"):
+            reset_database()
+            st.success("Database reset.")
+            st.rerun()
 
 with st.expander("Download normalized group diagnostics"):
     csv = trades.to_csv(index=False).encode("utf-8")
