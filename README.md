@@ -1,40 +1,35 @@
-# Gamma Risk Allocator
+# Gamma Risk Allocator — Group Upload Portal
 
-A Streamlit companion app for TradeSteward strategy management.
+A Streamlit app for daily TradeSteward uploads from a trading group.
 
-The app helps decide when to deploy **Weak**, **Range**, **Greenday**, and **Power Hour** based on realized gamma-risk conditions rather than VIX.
+## Purpose
 
-## What it does
+The app removes manual regime selection. Users upload current TradeSteward CSVs daily, and the app auto-detects the current gamma-risk regime from accumulated realized movement and stop-overrun/slippage behavior.
 
-- Upload TradeSteward CSV exports.
-- Calculates stop-overrun slippage using:
+## Workflow
 
-```text
-Slippage = max(0, actual loss - 1.5 × premium collected)
-```
-
-- Summarizes strategy-level gamma risk:
-  - stop-overrun rate
-  - average slippage event
-  - standard deviation of slippage
-  - expected slippage drag per trade
-  - maximum slippage
-- Classifies the current market regime:
-  - Compression / calm
-  - Normal
-  - Volatility expansion
-  - Gamma stress / crisis
-- Produces recommended allocation across:
-  - Weak
-  - Range
-  - Greenday
-  - Power Hour
+1. Each trader uploads a TradeSteward CSV.
+2. The app stores uploads in a local SQLite database.
+3. The app calculates:
+   - premium collected
+   - 150% stop threshold
+   - stop-overrun slippage
+   - strategy-level gamma-risk diagnostics
+   - daily slippage concentration
+4. The app auto-detects the regime:
+   - Compression / calm
+   - Normal
+   - Volatility expansion
+   - Gamma stress / crisis
+5. The app recommends allocation across:
+   - Weak
+   - Range
+   - Greenday
+   - Power Hour
 
 ## Core thesis
 
-The portfolio risk is driven less by traditional VIX and more by realized intraday gamma stress.
-
-Weak and Range are treated as core lower-gamma-risk strategies. Greenday and Power Hour are treated as tactical strategies for calmer/compressing regimes.
+The portfolio's dominant risk factor is gamma risk, not VIX. Weak and Range are treated as core lower-gamma-risk sleeves. Greenday and Power Hour are tactical sleeves for calm/compressing markets.
 
 ## Run locally
 
@@ -45,21 +40,19 @@ streamlit run app.py
 
 ## Deploy on Streamlit Cloud
 
-1. Create a GitHub repository.
-2. Upload these files:
-   - `app.py`
-   - `requirements.txt`
-   - `README.md`
-3. Go to Streamlit Cloud.
-4. Select the repo.
-5. Set the main file path to:
+Upload these files to GitHub:
+
+- `app.py`
+- `requirements.txt`
+- `README.md`
+- `.gitignore`
+
+Then deploy with main file path:
 
 ```text
 app.py
 ```
 
-6. Deploy.
+## Data note
 
-## Notes
-
-This is not financial advice. The gamma-risk score and allocation framework are research tools based on historical TradeSteward logs and user-defined assumptions.
+On Streamlit Cloud's free tier, local SQLite storage may reset when the app restarts. For durable group storage, connect the app to a persistent database or cloud storage later.
