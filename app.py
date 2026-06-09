@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -26,9 +26,11 @@ DB_PATH = DATA_DIR / "gamma_risk_allocator.sqlite3"
 DATA_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+STRATEGIES = ["Weak", "Range", "Greenday", "Power Hour"]
+
 st.title("Gamma Risk Allocator")
 st.caption(
-    "Daily group upload portal for TradeSteward logs. The app auto-detects gamma-risk regime and recommends strategy allocation."
+    "Upload TradeSteward logs by strategy. Historical backfills build the baseline; daily updates refresh the current gamma-risk signal."
 )
 
 
@@ -43,6 +45,7 @@ def init_db() -> None:
                 upload_id TEXT PRIMARY KEY,
                 trader_alias TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
+                upload_type TEXT NOT NULL,
                 original_filename TEXT NOT NULL,
                 stored_filename TEXT NOT NULL,
                 uploaded_at TEXT NOT NULL,
@@ -58,6 +61,7 @@ def init_db() -> None:
                 upload_id TEXT NOT NULL,
                 trader_alias TEXT NOT NULL,
                 strategy TEXT NOT NULL,
+                upload_type TEXT NOT NULL,
                 trade_date TEXT NOT NULL,
                 premium_credit REAL NOT NULL,
                 net_pl REAL NOT NULL,
@@ -73,6 +77,15 @@ def init_db() -> None:
             )
             """
         )
+
+        existing_upload_cols = {r[1] for r in conn.execute("PRAGMA table_info(uploads)").fetchall()}
+        if "upload_type" not in existing_upload_cols:
+            conn.execute("ALTER TABLE uploads ADD COLUMN upload_type TEXT NOT NULL DEFAULT 'Daily update'")
+
+        existing_trade_cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "upload_type" not in existing_trade_cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN upload_type TEXT NOT NULL DEFAULT 'Daily update'")
+
         conn.commit()
 
 
@@ -105,19 +118,6 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 def safe_alias(name: str) -> str:
     name = str(name or "").strip()
     return name if name else "Anonymous"
-
-
-def infer_strategy_from_filename(filename: str) -> str:
-    f = filename.lower()
-    if "weak" in f:
-        return "Weak"
-    if "range" in f:
-        return "Range"
-    if "green" in f:
-        return "Greenday"
-    if "power" in f:
-        return "Power Hour"
-    return "Unspecified"
 
 
 def hash_bytes(b: bytes) -> str:
@@ -165,12 +165,12 @@ def load_trade_file(file_bytes: bytes, strategy: str) -> pd.DataFrame:
     return out.dropna(subset=["trade_date", "premium_credit", "net_pl"])
 
 
-def save_upload(file, trader_alias: str, strategy_name: str) -> Tuple[str, int]:
+def save_upload(file, trader_alias: str, strategy_name: str, upload_type: str) -> Tuple[str, int]:
     file_bytes = file.getvalue()
     file_hash = hash_bytes(file_bytes)
-    upload_id = hashlib.sha1(f"{file_hash}-{datetime.utcnow().isoformat()}".encode()).hexdigest()[:16]
+    upload_id = hashlib.sha1(f"{file_hash}-{strategy_name}-{datetime.utcnow().isoformat()}".encode()).hexdigest()[:16]
 
-    stored_filename = f"{upload_id}_{file.name}"
+    stored_filename = f"{upload_id}_{strategy_name.replace(' ', '_')}_{file.name}"
     stored_path = UPLOAD_DIR / stored_filename
     stored_path.write_bytes(file_bytes)
 
@@ -180,15 +180,16 @@ def save_upload(file, trader_alias: str, strategy_name: str) -> Tuple[str, int]:
         conn.execute(
             """
             INSERT INTO uploads (
-                upload_id, trader_alias, strategy_name, original_filename,
+                upload_id, trader_alias, strategy_name, upload_type, original_filename,
                 stored_filename, uploaded_at, file_hash, row_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 upload_id,
                 trader_alias,
                 strategy_name,
+                upload_type,
                 file.name,
                 stored_filename,
                 datetime.utcnow().isoformat(),
@@ -201,17 +202,18 @@ def save_upload(file, trader_alias: str, strategy_name: str) -> Tuple[str, int]:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO trades (
-                    upload_id, trader_alias, strategy, trade_date,
+                    upload_id, trader_alias, strategy, upload_type, trade_date,
                     premium_credit, net_pl, actual_loss, stop_threshold,
                     slippage, stop_overrun, underlying_move_pct,
                     abs_underlying_move_pct, source_row_number
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     upload_id,
                     trader_alias,
                     strategy_name,
+                    upload_type,
                     str(r["trade_date"]),
                     float(r["premium_credit"]),
                     float(r["net_pl"]),
@@ -265,7 +267,32 @@ def summarize_strategy(df: pd.DataFrame) -> pd.DataFrame:
             "Max slippage": events["slippage"].max() if len(events) else 0,
             "Expected slippage / trade": total_slip / len(g) if len(g) else 0,
         })
-    return pd.DataFrame(rows)
+
+    result = pd.DataFrame(rows)
+
+    # Include missing strategies as zero rows so the dashboard always has the same structure.
+    existing = set(result["Strategy"]) if not result.empty else set()
+    missing_rows = []
+    for strategy in STRATEGIES:
+        if strategy not in existing:
+            missing_rows.append({
+                "Strategy": strategy,
+                "Trades": 0,
+                "Net P/L": 0,
+                "Stop overruns": 0,
+                "Overrun rate": 0,
+                "Total slippage": 0,
+                "Avg slippage event": 0,
+                "Std dev slippage": 0,
+                "Max slippage": 0,
+                "Expected slippage / trade": 0,
+            })
+    if missing_rows:
+        result = pd.concat([result, pd.DataFrame(missing_rows)], ignore_index=True)
+
+    order = {s: i for i, s in enumerate(STRATEGIES)}
+    result["sort_order"] = result["Strategy"].map(order).fillna(999)
+    return result.sort_values("sort_order").drop(columns=["sort_order"])
 
 
 def daily_stress(df: pd.DataFrame) -> pd.DataFrame:
@@ -290,7 +317,7 @@ def auto_regime(trades: pd.DataFrame) -> Tuple[str, str, float]:
     daily = daily_stress(trades)
 
     if daily.empty or len(daily) < 10:
-        return "Normal", "Not enough history yet. Defaulting to Normal until more daily uploads accumulate.", 50.0
+        return "Normal", "Not enough history yet. Upload historical backfill first to build a baseline.", 50.0
 
     recent = daily.tail(5)
     all_range = daily["avg_abs_spx_move"].dropna()
@@ -342,33 +369,48 @@ def regime_guidance(regime: str) -> str:
 
 
 # ------------------------------------------------------------
-# Sidebar upload portal
+# Sidebar upload portal — strategy-first design
 # ------------------------------------------------------------
 with st.sidebar:
-    st.header("Daily Upload")
+    st.header("Upload by Strategy")
 
     trader_alias = safe_alias(st.text_input("Trader name or Discord handle", placeholder="@name"))
-    strategy_choice = st.selectbox(
-        "Strategy",
-        ["Auto-detect from filename", "Weak", "Range", "Greenday", "Power Hour"],
+
+    upload_type = st.radio(
+        "Upload type",
+        ["Historical backfill", "Daily update"],
+        index=1,
+        help="Historical backfill builds the baseline. Daily update refreshes the current signal.",
     )
 
-    uploaded = st.file_uploader("Upload today's TradeSteward CSV", type=["csv"])
+    selected_strategy = st.selectbox(
+        "Strategy for these file(s)",
+        STRATEGIES,
+        index=0,
+        help="All files uploaded below will be stored under this strategy.",
+    )
 
-    if uploaded and st.button("Process upload", type="primary"):
+    uploaded_files = st.file_uploader(
+        f"Upload {selected_strategy} TradeSteward CSV file(s)",
+        type=["csv"],
+        accept_multiple_files=True,
+        help="Upload one or more CSVs for the selected strategy.",
+    )
+
+    if uploaded_files and st.button(f"Process {selected_strategy} upload(s)", type="primary"):
+        processed = 0
         try:
-            strategy = infer_strategy_from_filename(uploaded.name) if strategy_choice == "Auto-detect from filename" else strategy_choice
-            if strategy == "Unspecified":
-                st.error("Could not infer strategy from filename. Please select the strategy manually.")
-            else:
-                upload_id, rows = save_upload(uploaded, trader_alias, strategy)
-                st.success(f"Processed {rows} trades for {strategy}. Upload ID: {upload_id}")
+            for uploaded in uploaded_files:
+                upload_id, rows = save_upload(uploaded, trader_alias, selected_strategy, upload_type)
+                processed += 1
+                st.success(f"{upload_type}: processed {rows} {selected_strategy} trades. Upload ID: {upload_id}")
+            if processed:
                 st.rerun()
         except Exception as exc:
             st.error(str(exc))
 
     st.divider()
-    st.caption("The regime is auto-detected. No manual regime selection is used.")
+    st.caption("Upload is strategy-specific. Regime detection remains automatic.")
 
 
 # ------------------------------------------------------------
@@ -378,18 +420,22 @@ trades = load_all_trades()
 uploads = load_uploads()
 
 if trades.empty:
-    st.info("Upload TradeSteward CSVs to begin. The app will auto-detect the regime after enough daily history accumulates.")
+    st.info("Start by uploading historical backfill files by strategy. After that, use daily updates to refresh the signal.")
     st.stop()
+
+historical_trades = trades[trades["upload_type"] == "Historical backfill"].copy()
+daily_update_trades = trades[trades["upload_type"] == "Daily update"].copy()
 
 regime, note, gamma_score = auto_regime(trades)
 alloc = allocation_for_regime(regime)
 
 st.subheader("Today's Auto-Detected Gamma Regime")
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Regime", regime)
 c2.metric("Gamma score", f"{gamma_score:.0f}/100")
-c3.metric("Uploads", f"{len(uploads):,}")
+c3.metric("Historical trades", f"{len(historical_trades):,}")
+c4.metric("Daily update trades", f"{len(daily_update_trades):,}")
 
 st.info(regime_guidance(regime) + " " + note)
 
@@ -403,6 +449,40 @@ fig_alloc = px.bar(
 fig_alloc.update_traces(texttemplate="%{text:.0f}%", textposition="outside")
 fig_alloc.update_layout(yaxis_range=[0, 100])
 st.plotly_chart(fig_alloc, use_container_width=True)
+
+st.divider()
+st.subheader("Upload Coverage by Strategy")
+
+if uploads.empty:
+    st.warning("No uploads yet.")
+else:
+    coverage = (
+        uploads.groupby(["strategy_name", "upload_type"])
+        .agg(files=("upload_id", "count"), rows=("row_count", "sum"))
+        .reset_index()
+    )
+    st.dataframe(coverage, use_container_width=True)
+
+st.divider()
+st.subheader("Baseline vs Current Uploads")
+
+bc1, bc2 = st.columns(2)
+
+with bc1:
+    st.markdown("### Historical baseline")
+    if historical_trades.empty:
+        st.warning("No historical backfill uploaded yet.")
+    else:
+        hist_summary = summarize_strategy(historical_trades)
+        st.dataframe(hist_summary[["Strategy", "Trades", "Net P/L", "Overrun rate", "Expected slippage / trade"]], use_container_width=True)
+
+with bc2:
+    st.markdown("### Daily updates")
+    if daily_update_trades.empty:
+        st.warning("No daily update uploads yet.")
+    else:
+        day_summary = summarize_strategy(daily_update_trades)
+        st.dataframe(day_summary[["Strategy", "Trades", "Net P/L", "Overrun rate", "Expected slippage / trade"]], use_container_width=True)
 
 st.divider()
 st.subheader("Group Strategy Diagnostics")
@@ -486,7 +566,10 @@ with st.expander("Recent uploads"):
     if uploads.empty:
         st.write("No uploads yet.")
     else:
-        st.dataframe(uploads[["uploaded_at", "trader_alias", "strategy_name", "original_filename", "row_count"]], use_container_width=True)
+        st.dataframe(
+            uploads[["uploaded_at", "upload_type", "trader_alias", "strategy_name", "original_filename", "row_count"]],
+            use_container_width=True,
+        )
 
 with st.expander("Download normalized group diagnostics"):
     csv = trades.to_csv(index=False).encode("utf-8")
